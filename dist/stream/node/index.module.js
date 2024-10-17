@@ -1,38 +1,176 @@
-import {
-	encodeEntities,
-	styleObjToCss,
-	UNSAFE_NAME,
-	NAMESPACE_REPLACE_REGEX,
-	HTML_LOWER_CASE,
-	HTML_ENUMERATED,
-	SVG_CAMEL_CASE,
-	createComponent
-} from './lib/util.js';
+import { PassThrough } from 'node:stream';
 import { options, h, Fragment } from 'preact';
-import {
-	CHILDREN,
-	COMMIT,
-	COMPONENT,
-	DIFF,
-	DIFFED,
-	DIRTY,
-	NEXT_STATE,
-	PARENT,
-	RENDER,
-	SKIP_EFFECTS,
-	VNODE,
-	CATCH_ERROR
-} from './lib/constants.js';
+
+const UNSAFE_NAME = /[\s\n\\/='"\0<>]/;
+const NAMESPACE_REPLACE_REGEX = /^(xlink|xmlns|xml)([A-Z])/;
+const HTML_LOWER_CASE = /^(?:accessK|auto[A-Z]|cell|ch|col|cont|cross|dateT|encT|form[A-Z]|frame|hrefL|inputM|maxL|minL|noV|playsI|popoverT|readO|rowS|src[A-Z]|tabI|useM|item[A-Z])/;
+const SVG_CAMEL_CASE = /^ac|^ali|arabic|basel|cap|clipPath$|clipRule$|color|dominant|enable|fill|flood|font|glyph[^R]|horiz|image|letter|lighting|marker[^WUH]|overline|panose|pointe|paint|rendering|shape|stop|strikethrough|stroke|text[^L]|transform|underline|unicode|units|^v[^i]|^w|^xH/; // Boolean DOM properties that translate to enumerated ('true'/'false') attributes
+
+const HTML_ENUMERATED = new Set(['draggable', 'spellcheck']); // DOM properties that should NOT have "px" added when numeric
+
+const ENCODED_ENTITIES = /["&<]/;
+/** @param {string} str */
+
+function encodeEntities(str) {
+	// Skip all work for strings with no entities needing encoding:
+	if (str.length === 0 || ENCODED_ENTITIES.test(str) === false) return str;
+	let last = 0,
+		i = 0,
+		out = '',
+		ch = ''; // Seek forward in str until the next entity char:
+
+	for (; i < str.length; i++) {
+		switch (str.charCodeAt(i)) {
+			case 34:
+				ch = '&quot;';
+				break;
+
+			case 38:
+				ch = '&amp;';
+				break;
+
+			case 60:
+				ch = '&lt;';
+				break;
+
+			default:
+				continue;
+		} // Append skipped/buffered characters and the encoded entity:
+
+		if (i !== last) out = out + str.slice(last, i);
+		out = out + ch; // Start the next seek/buffer after the entity's offset:
+
+		last = i + 1;
+	}
+
+	if (i !== last) out = out + str.slice(last, i);
+	return out;
+}
+const JS_TO_CSS = {};
+const IS_NON_DIMENSIONAL = new Set([
+	'animation-iteration-count',
+	'border-image-outset',
+	'border-image-slice',
+	'border-image-width',
+	'box-flex',
+	'box-flex-group',
+	'box-ordinal-group',
+	'column-count',
+	'fill-opacity',
+	'flex',
+	'flex-grow',
+	'flex-negative',
+	'flex-order',
+	'flex-positive',
+	'flex-shrink',
+	'flood-opacity',
+	'font-weight',
+	'grid-column',
+	'grid-row',
+	'line-clamp',
+	'line-height',
+	'opacity',
+	'order',
+	'orphans',
+	'stop-opacity',
+	'stroke-dasharray',
+	'stroke-dashoffset',
+	'stroke-miterlimit',
+	'stroke-opacity',
+	'stroke-width',
+	'tab-size',
+	'widows',
+	'z-index',
+	'zoom'
+]);
+const CSS_REGEX = /[A-Z]/g; // Convert an Object style to a CSSText string
+
+function styleObjToCss(s) {
+	let str = '';
+
+	for (let prop in s) {
+		let val = s[prop];
+
+		if (val != null && val !== '') {
+			const name =
+				prop[0] == '-'
+					? prop
+					: JS_TO_CSS[prop] ||
+					  (JS_TO_CSS[prop] = prop.replace(CSS_REGEX, '-$&').toLowerCase());
+			let suffix = ';';
+
+			if (
+				typeof val === 'number' && // Exclude custom-attributes
+				!name.startsWith('--') &&
+				!IS_NON_DIMENSIONAL.has(name)
+			) {
+				suffix = 'px;';
+			}
+
+			str = str + name + ':' + val + suffix;
+		}
+	}
+
+	return str || undefined;
+}
+
+function markAsDirty() {
+	this.__d = true;
+}
+
+function createComponent(vnode, context) {
+	return {
+		__v: vnode,
+		context,
+		props: vnode.props,
+		// silently drop state updates
+		setState: markAsDirty,
+		forceUpdate: markAsDirty,
+		__d: true,
+		// hooks
+		__h: new Array(0)
+	};
+} // Necessary for createContext api. Setting this property will pass
+/**
+ * @template T
+ */
+
+class Deferred {
+	constructor() {
+		// eslint-disable-next-line lines-around-comment
+
+		/** @type {Promise<T>} */
+		this.promise = new Promise((resolve, reject) => {
+			this.resolve = resolve;
+			this.reject = reject;
+		});
+	}
+}
+
+// Options hooks
+const DIFF = '__b';
+const RENDER = '__r';
+const DIFFED = 'diffed';
+const COMMIT = '__c';
+const SKIP_EFFECTS = '__s';
+const CATCH_ERROR = '__e'; // VNode properties
+
+const COMPONENT = '__c';
+const CHILDREN = '__k';
+const PARENT = '__';
+
+const VNODE = '__v';
+const DIRTY = '__d';
+const NEXT_STATE = '__s';
+const CHILD_DID_SUSPEND = '__c';
 
 const EMPTY_OBJ = {};
 const EMPTY_ARR = [];
 const isArray = Array.isArray;
 const assign = Object.assign;
-const EMPTY_STR = '';
+const EMPTY_STR = ''; // Global state for the current render pass
 
-// Global state for the current render pass
 let beforeDiff, afterDiff, renderHook, ummountHook;
-
 /**
  * Render Preact JSX + Components to an HTML string.
  * @param {VNode} vnode	JSX Element / VNode to render
@@ -40,21 +178,20 @@ let beforeDiff, afterDiff, renderHook, ummountHook;
  * @param {RendererState} [_rendererState] for internal use
  * @returns {string} serialized HTML
  */
-export function renderToString(vnode, context, _rendererState) {
+
+function renderToString(vnode, context, _rendererState) {
 	// Performance optimization: `renderToString` is synchronous and we
 	// therefore don't execute any effects. To do that we pass an empty
 	// array to `options._commit` (`__c`). But we can go one step further
 	// and avoid a lot of dirty checks and allocations by setting
 	// `options._skipEffects` (`__s`) too.
 	const previousSkipEffects = options[SKIP_EFFECTS];
-	options[SKIP_EFFECTS] = true;
+	options[SKIP_EFFECTS] = true; // store options hooks once before each synchronous render call
 
-	// store options hooks once before each synchronous render call
 	beforeDiff = options[DIFF];
 	afterDiff = options[DIFFED];
 	renderHook = options[RENDER];
 	ummountHook = options.unmount;
-
 	const parent = h(Fragment, null);
 	parent[CHILDREN] = [vnode];
 
@@ -72,6 +209,7 @@ export function renderToString(vnode, context, _rendererState) {
 		if (isArray(rendered)) {
 			return rendered.join(EMPTY_STR);
 		}
+
 		return rendered;
 	} catch (e) {
 		if (e.then) {
@@ -87,78 +225,18 @@ export function renderToString(vnode, context, _rendererState) {
 		EMPTY_ARR.length = 0;
 	}
 }
-
-/**
- * Render Preact JSX + Components to an HTML string.
- * @param {VNode} vnode	JSX Element / VNode to render
- * @param {Object} [context={}] Initial root context object
- * @returns {string} serialized HTML
- */
-export async function renderToStringAsync(vnode, context) {
-	// Performance optimization: `renderToString` is synchronous and we
-	// therefore don't execute any effects. To do that we pass an empty
-	// array to `options._commit` (`__c`). But we can go one step further
-	// and avoid a lot of dirty checks and allocations by setting
-	// `options._skipEffects` (`__s`) too.
-	const previousSkipEffects = options[SKIP_EFFECTS];
-	options[SKIP_EFFECTS] = true;
-
-	// store options hooks once before each synchronous render call
-	beforeDiff = options[DIFF];
-	afterDiff = options[DIFFED];
-	renderHook = options[RENDER];
-	ummountHook = options.unmount;
-
-	const parent = h(Fragment, null);
-	parent[CHILDREN] = [vnode];
-
-	try {
-		const rendered = await _renderToString(
-			vnode,
-			context || EMPTY_OBJ,
-			false,
-			undefined,
-			parent,
-			true,
-			undefined
-		);
-
-		if (isArray(rendered)) {
-			let count = 0;
-			let resolved = rendered;
-
-			// Resolving nested Promises with a maximum depth of 25
-			while (
-				resolved.some(
-					(element) => element && typeof element.then === 'function'
-				) &&
-				count++ < 25
-			) {
-				resolved = (await Promise.all(resolved)).flat();
-			}
-
-			return resolved.join(EMPTY_STR);
-		}
-
-		return rendered;
-	} finally {
-		// options._commit, we don't schedule any effects in this library right now,
-		// so we can pass an empty queue to this hook.
-		if (options[COMMIT]) options[COMMIT](vnode, EMPTY_ARR);
-		options[SKIP_EFFECTS] = previousSkipEffects;
-		EMPTY_ARR.length = 0;
-	}
-}
-
 /**
  * @param {VNode} vnode
  * @param {Record<string, unknown>} context
  */
-function renderClassComponent(vnode, context) {
-	let type = /** @type {import("preact").ComponentClass<typeof vnode.props>} */ (vnode.type);
 
+function renderClassComponent(vnode, context) {
+	let type =
+		/** @type {import("preact").ComponentClass<typeof vnode.props>} */
+		vnode.type;
 	let isMounting = true;
 	let c;
+
 	if (vnode[COMPONENT]) {
 		isMounting = false;
 		c = vnode[COMPONENT];
@@ -169,12 +247,10 @@ function renderClassComponent(vnode, context) {
 
 	vnode[COMPONENT] = c;
 	c[VNODE] = vnode;
-
 	c.props = vnode.props;
-	c.context = context;
-	// turn off stateful re-rendering:
-	c[DIRTY] = true;
+	c.context = context; // turn off stateful re-rendering:
 
+	c[DIRTY] = true;
 	if (c.state == null) c.state = EMPTY_OBJ;
 
 	if (c[NEXT_STATE] == null) {
@@ -188,20 +264,17 @@ function renderClassComponent(vnode, context) {
 			type.getDerivedStateFromProps(c.props, c.state)
 		);
 	} else if (isMounting && c.componentWillMount) {
-		c.componentWillMount();
-
-		// If the user called setState in cWM we need to flush pending,
+		c.componentWillMount(); // If the user called setState in cWM we need to flush pending,
 		// state updates. This is the same behaviour in React.
+
 		c.state = c[NEXT_STATE] !== c.state ? c[NEXT_STATE] : c.state;
 	} else if (!isMounting && c.componentWillUpdate) {
 		c.componentWillUpdate();
 	}
 
 	if (renderHook) renderHook(vnode);
-
 	return c.render(c.props, c.state, context);
 }
-
 /**
  * Recursively render VNodes to HTML.
  * @param {VNode|any} vnode
@@ -213,6 +286,7 @@ function renderClassComponent(vnode, context) {
  * @param {RendererState | undefined} [renderer]
  * @returns {string | Promise<string> | (string | Promise<string>)[]}
  */
+
 function _renderToString(
 	vnode,
 	context,
@@ -232,18 +306,18 @@ function _renderToString(
 		return EMPTY_STR;
 	}
 
-	let vnodeType = typeof vnode;
-	// Text VNodes: escape as HTML
+	let vnodeType = typeof vnode; // Text VNodes: escape as HTML
+
 	if (vnodeType != 'object') {
 		if (vnodeType == 'function') return EMPTY_STR;
 		return vnodeType == 'string' ? encodeEntities(vnode) : vnode + EMPTY_STR;
-	}
+	} // Recurse into children / Arrays
 
-	// Recurse into children / Arrays
 	if (isArray(vnode)) {
 		let rendered = EMPTY_STR,
 			renderArray;
 		parent[CHILDREN] = vnode;
+
 		for (let i = 0; i < vnode.length; i++) {
 			let child = vnode[i];
 			if (child == null || typeof child == 'boolean') continue;
@@ -266,7 +340,6 @@ function _renderToString(
 				}
 
 				if (rendered) renderArray.push(rendered);
-
 				rendered = EMPTY_STR;
 
 				if (isArray(childRender)) {
@@ -283,35 +356,32 @@ function _renderToString(
 		}
 
 		return rendered;
-	}
+	} // VNodes have {constructor:undefined} to prevent JSON injection:
 
-	// VNodes have {constructor:undefined} to prevent JSON injection:
 	if (vnode.constructor !== undefined) return EMPTY_STR;
-
 	vnode[PARENT] = parent;
 	if (beforeDiff) beforeDiff(vnode);
-
 	let type = vnode.type,
-		props = vnode.props;
+		props = vnode.props; // Invoke rendering on Components
 
-	// Invoke rendering on Components
 	if (typeof type == 'function') {
 		let cctx = context,
 			contextType,
 			rendered,
 			component;
+
 		if (type === Fragment) {
 			// Serialized precompiled JSX.
 			if ('tpl' in props) {
 				let out = EMPTY_STR;
+
 				for (let i = 0; i < props.tpl.length; i++) {
 					out = out + props.tpl[i];
 
 					if (props.exprs && i < props.exprs.length) {
 						const value = props.exprs[i];
-						if (value == null) continue;
+						if (value == null) continue; // Check if we're dealing with a vnode or an array of nodes
 
-						// Check if we're dealing with a vnode or an array of nodes
 						if (
 							typeof value == 'object' &&
 							(value.constructor === undefined || isArray(value))
@@ -344,6 +414,7 @@ function _renderToString(
 			rendered = props.children;
 		} else {
 			contextType = type.contextType;
+
 			if (contextType != null) {
 				let provider = context[contextType.__c];
 				cctx = provider ? provider.props.value : contextType.__;
@@ -351,28 +422,29 @@ function _renderToString(
 
 			let isClassComponent =
 				type.prototype && typeof type.prototype.render == 'function';
+
 			if (isClassComponent) {
-				rendered = /**#__NOINLINE__**/ renderClassComponent(vnode, cctx);
+				rendered =
+					/**#__NOINLINE__**/
+					renderClassComponent(vnode, cctx);
 				component = vnode[COMPONENT];
 			} else {
-				vnode[COMPONENT] = component = /**#__NOINLINE__**/ createComponent(
-					vnode,
-					cctx
-				);
-
-				// If a hook invokes setState() to invalidate the component during rendering,
+				vnode[COMPONENT] = component =
+					/**#__NOINLINE__**/
+					createComponent(vnode, cctx); // If a hook invokes setState() to invalidate the component during rendering,
 				// re-render it up to 25 times to allow "settling" of memoized states.
 				// Note:
 				//   This will need to be updated for Preact 11 to use internal.flags rather than component._dirty:
 				//   https://github.com/preactjs/preact/blob/d4ca6fdb19bc715e49fd144e69f7296b2f4daa40/src/diff/component.js#L35-L44
+
 				let count = 0;
+
 				while (component[DIRTY] && count++ < 25) {
 					component[DIRTY] = false;
-
 					if (renderHook) renderHook(vnode);
-
 					rendered = type.call(component, props, cctx);
 				}
+
 				component[DIRTY] = true;
 			}
 
@@ -427,7 +499,6 @@ function _renderToString(
 							rendered.key == null &&
 							rendered.props.tpl == null;
 						rendered = isTopLevelFragment ? rendered.props.children : rendered;
-
 						return _renderToString(
 							rendered,
 							context,
@@ -443,14 +514,12 @@ function _renderToString(
 				} finally {
 					if (afterDiff) afterDiff(vnode);
 					vnode[PARENT] = null;
-
 					if (ummountHook) ummountHook(vnode);
 				}
 			}
-		}
-
-		// When a component returns a Fragment node we flatten it in core, so we
+		} // When a component returns a Fragment node we flatten it in core, so we
 		// need to mirror that logic here too
+
 		let isTopLevelFragment =
 			rendered != null &&
 			rendered.type === Fragment &&
@@ -470,12 +539,10 @@ function _renderToString(
 				renderer
 			);
 
-			if (afterDiff) afterDiff(vnode);
-			// when we are dealing with suspense we can't do this...
+			if (afterDiff) afterDiff(vnode); // when we are dealing with suspense we can't do this...
+
 			vnode[PARENT] = null;
-
 			if (options.unmount) options.unmount(vnode);
-
 			return str;
 		} catch (error) {
 			if (!asyncMode && renderer && renderer.onError) {
@@ -490,16 +557,13 @@ function _renderToString(
 						renderer
 					)
 				);
-
 				if (res !== undefined) return res;
-
 				let errorHook = options[CATCH_ERROR];
 				if (errorHook) errorHook(error, vnode);
 				return EMPTY_STR;
 			}
 
 			if (!asyncMode) throw error;
-
 			if (!error || typeof error.then != 'function') throw error;
 
 			const renderNestedChildren = () => {
@@ -515,7 +579,6 @@ function _renderToString(
 					);
 				} catch (e) {
 					if (!e || typeof e.then != 'function') throw e;
-
 					return e.then(
 						() =>
 							_renderToString(
@@ -534,9 +597,8 @@ function _renderToString(
 
 			return error.then(renderNestedChildren);
 		}
-	}
+	} // Serialize Element VNodes to HTML
 
-	// Serialize Element VNodes to HTML
 	let s = '<' + type,
 		html = EMPTY_STR,
 		children;
@@ -552,69 +614,77 @@ function _renderToString(
 			case 'children':
 				children = v;
 				continue;
-
 			// VDOM-specific props
+
 			case 'key':
 			case 'ref':
 			case '__self':
 			case '__source':
 				continue;
-
 			// prefer for/class over htmlFor/className
+
 			case 'htmlFor':
 				if ('for' in props) continue;
 				name = 'for';
 				break;
+
 			case 'className':
 				if ('class' in props) continue;
 				name = 'class';
 				break;
-
 			// Form element reflected properties
+
 			case 'defaultChecked':
 				name = 'checked';
 				break;
+
 			case 'defaultSelected':
 				name = 'selected';
 				break;
-
 			// Special value attribute handling
+
 			case 'defaultValue':
 			case 'value':
 				name = 'value';
+
 				switch (type) {
 					// <textarea value="a&b"> --> <textarea>a&amp;b</textarea>
 					case 'textarea':
 						children = v;
 						continue;
-
 					// <select value> is serialized as a selected attribute on the matching option child
+
 					case 'select':
 						selectValue = v;
 						continue;
-
 					// Add a selected attribute to <option> if its value matches the parent <select> value
+
 					case 'option':
 						if (selectValue == v && !('selected' in props)) {
 							s = s + ' selected';
 						}
+
 						break;
 				}
+
 				break;
 
 			case 'dangerouslySetInnerHTML':
 				html = v && v.__html;
 				continue;
-
 			// serialize object styles to a CSS string
+
 			case 'style':
 				if (typeof v === 'object') {
 					v = styleObjToCss(v);
 				}
+
 				break;
+
 			case 'acceptCharset':
 				name = 'accept-charset';
 				break;
+
 			case 'httpEquiv':
 				name = 'http-equiv';
 				break;
@@ -641,9 +711,8 @@ function _renderToString(
 					name = name.toLowerCase();
 				}
 			}
-		}
+		} // write this attribute to the buffer
 
-		// write this attribute to the buffer
 		if (v != null && v !== false) {
 			if (v === true || v === EMPTY_STR) {
 				s = s + ' ' + name;
@@ -665,9 +734,8 @@ function _renderToString(
 		throw new Error(`${type} is not a valid HTML tag name in ${s}>`);
 	}
 
-	if (html) {
-		// dangerouslySetInnerHTML defined this node's contents
-	} else if (typeof children === 'string') {
+	if (html);
+	else if (typeof children === 'string') {
 		// single text child
 		html = encodeEntities(children);
 	} else if (children != null && children !== false && children !== true) {
@@ -685,21 +753,17 @@ function _renderToString(
 		);
 	}
 
-	if (afterDiff) afterDiff(vnode);
+	if (afterDiff) afterDiff(vnode); // TODO: this was commented before
 
-	// TODO: this was commented before
 	vnode[PARENT] = null;
+	if (ummountHook) ummountHook(vnode); // Emit self-closing tag for empty void elements:
 
-	if (ummountHook) ummountHook(vnode);
-
-	// Emit self-closing tag for empty void elements:
 	if (!html && SELF_CLOSING.has(type)) {
 		return s + '/>';
 	}
 
 	const endTag = '</' + type + '>';
 	const startTag = s + '>';
-
 	if (isArray(html)) return [startTag, ...html, endTag];
 	else if (typeof html != 'string') return [startTag, html, endTag];
 	return startTag + html + endTag;
@@ -724,6 +788,213 @@ const SELF_CLOSING = new Set([
 	'wbr'
 ]);
 
-export default renderToString;
-export const render = renderToString;
-export const renderToStaticMarkup = renderToString;
+/* eslint-disable no-var, key-spacing, object-curly-spacing, prefer-arrow-callback, semi, keyword-spacing */
+// function initPreactIslandElement() {
+// 	class PreactIslandElement extends HTMLElement {
+// 		connectedCallback() {
+// 			var d = this;
+// 			if (!d.isConnected) return;
+// 			let i = this.getAttribute('data-target');
+// 			if (!i) return;
+// 			var s,
+// 				e,
+// 				c = document.createNodeIterator(document, 128);
+// 			while (c.nextNode()) {
+// 				let n = c.referenceNode;
+// 				if (n.data == 'preact-island:' + i) s = n;
+// 				else if (n.data == '/preact-island:' + i) e = n;
+// 				if (s && e) break;
+// 			}
+// 			if (s && e) {
+// 				requestAnimationFrame(() => {
+// 					var p = e.previousSibling;
+// 					while (p != s) {
+// 						if (!p || p == s) break;
+// 						e.parentNode.removeChild(p);
+// 						p = e.previousSibling;
+// 					}
+// 					c = s;
+// 					while (d.firstChild) {
+// 						s = d.firstChild;
+// 						d.removeChild(s);
+// 						c.after(s);
+// 						c = s;
+// 					}
+// 					d.parentNode.removeChild(d);
+// 				});
+// 			}
+// 		}
+// 	}
+// 	customElements.define('preact-island', PreactIslandElement);
+// }
+// To modify the INIT_SCRIPT, uncomment the above code, modify it, and paste it into https://try.terser.org/.
+const INIT_SCRIPT = `class e extends HTMLElement{connectedCallback(){var e=this;if(!e.isConnected)return;let t=this.getAttribute("data-target");if(t){for(var r,a,i=document.createNodeIterator(document,128);i.nextNode();){let e=i.referenceNode;if(e.data=="preact-island:"+t?r=e:e.data=="/preact-island:"+t&&(a=e),r&&a)break}r&&a&&requestAnimationFrame((()=>{for(var t=a.previousSibling;t!=r&&t&&t!=r;)a.parentNode.removeChild(t),t=a.previousSibling;for(i=r;e.firstChild;)r=e.firstChild,e.removeChild(r),i.after(r),i=r;e.parentNode.removeChild(e)}))}}}customElements.define("preact-island",e);`;
+function createInitScript() {
+	return `<script>(function(){${INIT_SCRIPT}}())</script>`;
+}
+/**
+ * @param {string} id
+ * @param {string} content
+ * @returns {string}
+ */
+
+function createSubtree(id, content) {
+	return `<preact-island hidden data-target="${id}">${content}</preact-island>`;
+}
+
+/**
+ * @param {VNode} vnode
+ * @param {RenderToChunksOptions} options
+ * @returns {Promise<void>}
+ */
+
+async function renderToChunks(vnode, { context, onWrite, abortSignal }) {
+	context = context || {};
+	/** @type {RendererState} */
+
+	const renderer = {
+		start: Date.now(),
+		abortSignal,
+		onWrite,
+		onError: handleError,
+		suspended: []
+	}; // Synchronously render the shell
+	// @ts-ignore - using third internal RendererState argument
+
+	const shell = renderToString(vnode, context, renderer);
+	onWrite(shell); // Wait for any suspended sub-trees if there are any
+
+	const len = renderer.suspended.length;
+
+	if (len > 0) {
+		onWrite('<div hidden>');
+		onWrite(createInitScript()); // We should keep checking all promises
+
+		await forkPromises(renderer);
+		onWrite('</div>');
+	}
+}
+
+async function forkPromises(renderer) {
+	if (renderer.suspended.length > 0) {
+		const suspensions = [...renderer.suspended];
+		await Promise.all(renderer.suspended.map((s) => s.promise));
+		renderer.suspended = renderer.suspended.filter(
+			(s) => !suspensions.includes(s)
+		);
+		await forkPromises(renderer);
+	}
+}
+/** @type {RendererErrorHandler} */
+
+function handleError(error, vnode, renderChild) {
+	if (!error || !error.then) return; // walk up to the Suspense boundary
+
+	while ((vnode = vnode[PARENT])) {
+		let component = vnode[COMPONENT];
+
+		if (component && component[CHILD_DID_SUSPEND]) {
+			break;
+		}
+	}
+
+	if (!vnode) return;
+	const id = vnode.__v;
+	const found = this.suspended.find((x) => x.id === id);
+	const race = new Deferred();
+	const abortSignal = this.abortSignal;
+
+	if (abortSignal) {
+		// @ts-ignore 2554 - implicit undefined arg
+		if (abortSignal.aborted) race.resolve();
+		else abortSignal.addEventListener('abort', race.resolve);
+	}
+
+	const promise = error.then(
+		() => {
+			if (abortSignal && abortSignal.aborted) return;
+			const child = renderChild(vnode.props.children);
+			if (child) this.onWrite(createSubtree(id, child));
+		}, // TODO: Abort and send hydration code snippet to client
+		// to attempt to recover during hydration
+		this.onError
+	);
+	this.suspended.push({
+		id,
+		vnode,
+		promise: Promise.race([promise, race.promise])
+	});
+	const fallback = renderChild(vnode.props.fallback);
+	return found
+		? ''
+		: `<!--preact-island:${id}-->${fallback}<!--/preact-island:${id}-->`;
+}
+
+/**
+ * @typedef {object} RenderToPipeableStreamOptions
+ * @property {() => void} [onShellReady]
+ * @property {() => void} [onAllReady]
+ * @property {(error) => void} [onError]
+ */
+
+/**
+ * @typedef {object} PipeableStream
+ * @property {() => void} abort
+ * @property {(writable: import('stream').Writable) => void} pipe
+ */
+
+/**
+ * @param {import('preact').VNode} vnode
+ * @param {RenderToPipeableStreamOptions} options
+ * @param {any} [context]
+ * @returns {PipeableStream}
+ */
+
+function renderToPipeableStream(vnode, options, context) {
+	const encoder = new TextEncoder('utf-8');
+	const controller = new AbortController();
+	const stream = new PassThrough();
+	renderToChunks(vnode, {
+		context,
+		abortSignal: controller.signal,
+		onError: (error) => {
+			if (options.onError) {
+				options.onError(error);
+			}
+
+			controller.abort(error);
+		},
+
+		onWrite(s) {
+			stream.write(encoder.encode(s));
+		}
+	})
+		.then(() => {
+			options.onAllReady && options.onAllReady();
+			stream.end();
+		})
+		.catch((error) => {
+			stream.destroy(error);
+		});
+	Promise.resolve().then(() => {
+		options.onShellReady && options.onShellReady();
+	});
+	return {
+		abort() {
+			controller.abort();
+			stream.destroy(new Error('aborted'));
+		},
+
+		/**
+		 * @param {import("stream").Writable} writable
+		 */
+		pipe(writable) {
+			stream.pipe(writable, {
+				end: true
+			});
+		}
+	};
+}
+
+export { renderToPipeableStream };
+//# sourceMappingURL=index.module.js.map
